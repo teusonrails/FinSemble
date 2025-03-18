@@ -1,0 +1,47 @@
+# Configurações dos Classificadores
+classifiers:
+  bernoulli_nb:
+    alpha: 1.0
+    binarize: 0.0
+    fit_prior: true
+  multinomial_nb:
+    alpha: 1.0
+    fit_prior: true
+  gaussian_nb:
+    var_smoothing: 1e-9
+  topic_extractor:
+    num_topics: 20
+    method: "lda"  # Latent Dirichlet Allocation
+
+# Configurações do Agregador Bayesiano
+aggregator:
+  network_structure: "auto"  # "auto" ou "manual"
+  inference_method: "belief_propagation"
+  learning_rate: 0.01
+  max_iterations: 100
+
+# Configurações do Motor de Contextualização
+contextualizer:
+  context_window: 30  # Janela temporal (dias) para análise de contexto
+  external_sources: ["market_data", "news_headlines", "economic_indicators"]
+  impact_threshold: 0.05
+
+# Configurações da Interface de Explicabilidade
+explainer:
+  min_confidence: 0.7
+  max_features_displayed: 10
+  show_probability: true
+  explanation_format: "text_and_visual"
+
+# Configurações de Logging
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  to_file: true
+  
+# Configurações de Avaliação
+evaluation:
+  cv_folds: 10
+  test_size: 0.2
+  random_state: 42
+  metrics: ["accuracy", "precision", "recall", "f1", "roc_auc"]
