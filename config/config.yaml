@@ -1,3 +1,60 @@
+# Configuração do Sistema FinSemble
+
+# Caminhos de diretórios
+paths:
+  data_raw: "data/raw"
+  data_processed: "data/processed"
+  knowledge_base: "data/knowledge_base"
+  models: "models"
+  logs: "logs"
+  resources: "data/resources"
+
+# Configurações do Preprocessador Universal
+preprocessor:
+  normalizer:
+    lowercase: true
+    remove_punctuation: true
+    remove_numbers: false
+    remove_stopwords: true
+    lemmatize: true
+  tokenizer:
+    sentence_split: true
+    word_split: true
+    ngram_range: [1, 3]
+  language: "portuguese"  # Idioma principal (português)
+  fallback_enabled: true   # Habilitar fallbacks em caso de erros
+  performance_monitoring: true  # Monitorar métricas de performance
+  feature_extractor:
+    feature_types: ["type_features", "sentiment_features", "impact_features", "topic_features"]
+    max_features: 1000
+
+# Configurações de Recursos Externos
+resources:
+  resources_path: "data/resources"
+  language: "portuguese"
+  fallback_enabled: true
+  offline_mode: false  # Definir como true para ambientes sem internet
+  spacy_models:
+    portuguese: ["pt_core_news_sm", "pt_core_news_lg"]
+    english: ["en_core_web_sm", "en_core_web_md"]
+
+# Configurações de Validação de Inputs
+validation:
+  text:
+    min_length: 1
+    max_length: 1000000
+    allow_empty: false
+  metadata:
+    required_fields: []  # Campos obrigatórios nos metadados
+    allowed_fields: null  # null = sem restrições
+
+# Configurações de Processamento Paralelo
+parallel_processing:
+  engine: "auto"  # "auto", "dask", "ray", ou "threads"
+  n_workers: null  # null = usar número de CPUs disponíveis
+  batch_size: 100
+  progress_bar: true
+  
 # Configurações dos Classificadores
 classifiers:
   bernoulli_nb:
@@ -16,9 +73,18 @@ classifiers:
 # Configurações do Agregador Bayesiano
 aggregator:
   network_structure: "auto"  # "auto" ou "manual"
-  inference_method: "belief_propagation"
+  inference_method: "variable_elimination"
   learning_rate: 0.01
   max_iterations: 100
+  convergence_threshold: 1e-6
+  use_advanced_meta_learning: true
+  adaptive_inference: true
+  network_cache_enabled: true
+  cache_max_size: 100
+  meta_learning:
+    method: "stacking"
+    history_size: 200
+    max_history_size: 1000
 
 # Configurações do Motor de Contextualização
 contextualizer:
