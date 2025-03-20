@@ -255,35 +255,53 @@ class BayesianAggregator:
         start_time = time.time()
         logger.info("Iniciando agregação de resultados dos classificadores")
         
-        # Validar entradas
-        if not classifier_outputs:
-            logger.warning("Nenhuma saída de classificador fornecida")
-            return {"error": "Nenhuma saída de classificador fornecida"}
-            
         try:
-            ## Mapear saídas dos classificadores para o formato esperado pela rede
-            mapped_outputs = self._map_classifier_outputs(classifier_outputs)
-            
-            # Extrair evidências dos classificadores
-            evidence = self._extract_evidence(mapped_outputs)
-            
-            # Definir nós de consulta
-            query_nodes = ["market_direction", "investment_horizon", "risk_level", "confidence_level"]
-            
-            # Realizar inferência na rede bayesiana
-            inference_results = self._inference(evidence, query_nodes)
-            
-            # Aplicar meta-classificação para refinar resultados
-            meta_results = self.meta_classifier.combine_predictions(classifier_outputs, context)
-            
-            # Combinar resultados da rede bayesiana e meta-classificação
-            combined_analysis = self._combine_results(inference_results, meta_results, mapped_outputs)
-            
-            # Adicionar dados de explicabilidade
-            combined_analysis["explanations"] = self._generate_detailed_explanations(
-                classifier_outputs, inference_results, meta_results, mapped_outputs
-            )
-            
+            # Validar entradas
+            if not classifier_outputs:
+                raise ErrorHandler.create_exception(
+                    "Nenhuma saída de classificador fornecida",
+                    code=ErrorCode.INVALID_INPUT,
+                    component="BayesianAggregator"
+                )
+                
+            # Verificar se algum classificador reportou erro
+            for classifier_name, output in classifier_outputs.items():
+                if "error" in output:
+                    logger.warning(f"Classificador {classifier_name} reportou erro: {output['error_message']}")
+                    # Podemos decidir continuar com classificadores disponíveis
+                    # ou levantar exceção dependendo da configuração
+                    if not self.adaptive_inference:
+                        raise ErrorHandler.create_exception(
+                            f"Erro no classificador {classifier_name}: {output.get('error_message', 'Erro desconhecido')}",
+                            code=ErrorCode.INFERENCE_ERROR,
+                            component="BayesianAggregator",
+                            details={"classifier_error": output}
+                        )
+        
+                
+                ## Mapear saídas dos classificadores para o formato esperado pela rede
+                mapped_outputs = self._map_classifier_outputs(classifier_outputs)
+                
+                # Extrair evidências dos classificadores
+                evidence = self._extract_evidence(mapped_outputs)
+                
+                # Definir nós de consulta
+                query_nodes = ["market_direction", "investment_horizon", "risk_level", "confidence_level"]
+                
+                # Realizar inferência na rede bayesiana
+                inference_results = self._inference(evidence, query_nodes)
+                
+                # Aplicar meta-classificação para refinar resultados
+                meta_results = self.meta_classifier.combine_predictions(classifier_outputs, context)
+                
+                # Combinar resultados da rede bayesiana e meta-classificação
+                combined_analysis = self._combine_results(inference_results, meta_results, mapped_outputs)
+                
+                # Adicionar dados de explicabilidade
+                combined_analysis["explanations"] = self._generate_detailed_explanations(
+                    classifier_outputs, inference_results, meta_results, mapped_outputs
+                )
+                
             # Atualizar estatísticas
             inference_time = time.time() - start_time
             self.stats["inference_count"] += 1
@@ -292,18 +310,17 @@ class BayesianAggregator:
                 self.stats["total_inference_time"] / self.stats["inference_count"]
             )
             
-            logger.info(f"Agregação concluída em {inference_time:.3f}s")
             combined_analysis["inference_time"] = inference_time
             combined_analysis["inference_method"] = self._select_inference_method(evidence, query_nodes)
             
             return combined_analysis
             
+        except FinSembleException as e:
+            return e.to_dict()
         except Exception as e:
-            logger.error(f"Erro durante agregação: {str(e)}", exc_info=True)
-            return {
-                "error": f"Erro durante agregação: {str(e)}",
-                "inference_time": time.time() - start_time
-            }
+            return ErrorHandler.handle_exception(
+                e, "BayesianAggregator", fallback_enabled=self.adaptive_inference
+            )
             
     def _extract_evidence(self, classifier_outputs: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
         """

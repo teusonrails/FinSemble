@@ -70,18 +70,43 @@ class WeightNormalizedComplementNB(ComplementNB):
         Returns:
             Matriz de pesos por classe
         """
-        # Chama a implementação original
-        weight = super()._count_alpha(X, y)
+        # Obter classes únicas e suas contagens
+        self.classes_, y_inv = np.unique(y, return_inverse=True)
+        n_classes = len(self.classes_)
         
-        # Aplica transformação logarítmica para atenuar diferenças extremas
+        # Calcular contagens de classe
+        n_samples, n_features = X.shape
+        self.class_count_ = np.zeros(n_classes, dtype=np.float64)
+        np.add.at(self.class_count_, y_inv, 1)
+        
+        # Soma das características para cada classe
+        feature_count = np.zeros((n_classes, n_features), dtype=np.float64)
+        np.add.at(feature_count, y_inv, X)
+        
+        # Soma total de características
+        total_feature_count = feature_count.sum(axis=0)
+        
+        # Complement counts (contagens de todas as classes exceto a atual)
+        comp_feature_count = total_feature_count - feature_count
+        comp_class_count = n_samples - self.class_count_
+        
+        # Aplicar suavização de Laplace
+        feature_count += self.alpha
+        comp_feature_count += self.alpha * n_classes
+        
+        # Calcular probabilidades de características complementares
+        with np.errstate(divide='ignore', invalid='ignore'):
+            feature_prob = comp_feature_count / comp_class_count[:, np.newaxis]
+        
+        # Aplicar transformação logarítmica para atenuar diferenças extremas
         # log(1+x) é mais estável que log(x) pois evita log(0) = -inf
-        weight = np.log(1.0 + weight)
+        feature_prob = np.log(1.0 + feature_prob)
         
-        # Normaliza os vetores de peso para cada classe
+        # Normalizar os vetores de peso para cada classe
         if self.norm:
-            weight = normalize(weight, axis=1, norm='l2')
+            feature_prob = normalize(feature_prob, axis=1, norm='l2')
             
-        return weight
+        return feature_prob
 
 class SentimentAnalyzer(BaseClassifier):
     """
@@ -587,6 +612,10 @@ class SentimentAnalyzer(BaseClassifier):
         if not is_valid:
             return error
             
+        # Verificar se o modelo possui as propriedades necessárias
+        if not hasattr(self, 'feature_names_') or not hasattr(self, 'classes_'):
+            return {"error": "Modelo não está completamente inicializado", "error_code": "MODEL_INITIALIZATION_ERROR"}
+        
         start_time = time.time()
         logger.debug(f"Iniciando predição para amostra")
         
@@ -594,25 +623,31 @@ class SentimentAnalyzer(BaseClassifier):
             # Extrair características
             features = self._extract_features(data)
             
+            # Verificar se features não é None
+            if features is None:
+                return {"error": "Falha na extração de características", "error_code": "FEATURE_EXTRACTION_ERROR"}
+                
             # Verificar dimensão das características
             if len(features.shape) < 2:
                 # Reshapear para batch de uma amostra
                 features = features.reshape(1, -1)
                 
-            # Verificar se o tamanho das características é compatível com o modelo
-            expected_size = len(self.feature_names)
+            # Verificar compatibilidade de dimensões
+            expected_size = len(self.feature_names_)
             actual_size = features.shape[1]
             
             if actual_size != expected_size:
                 logger.warning(f"Dimensão incompatível de características: obtido {actual_size}, "
-                             f"esperado {expected_size}")
-                             
-                # Ajustar tamanho (preencher com zeros ou truncar)
+                            f"esperado {expected_size}")
+                            
+                # Estratégia adaptativa para lidar com diferenças de dimensão
                 if actual_size < expected_size:
+                    # Preencher com zeros
                     padded = np.zeros((1, expected_size))
                     padded[0, :actual_size] = features[0, :actual_size]
                     features = padded
                 else:
+                    # Truncar para tamanho esperado
                     features = features[0, :expected_size].reshape(1, -1)
                     
             # Realizar predição
@@ -629,11 +664,8 @@ class SentimentAnalyzer(BaseClassifier):
             
             # Converter código da classe para nome legível, se disponível
             predicted_class_str = str(predicted_class)
-            if predicted_class_str in self.class_mapping:
-                readable_class = self.class_mapping[predicted_class_str]
-            else:
-                readable_class = predicted_class_str
-                
+            readable_class = self.class_mapping.get(predicted_class_str, predicted_class_str)
+            
             # Atualizar estatísticas
             inference_time = time.time() - start_time
             self.stats["inference_count"] += 1
@@ -643,8 +675,8 @@ class SentimentAnalyzer(BaseClassifier):
             )
             
             logger.debug(f"Predição concluída em {inference_time*1000:.2f}ms. "
-                       f"Classe: {predicted_class_str}, Confiança: {max(probabilities):.4f}")
-                       
+                    f"Classe: {predicted_class_str}, Confiança: {max(probabilities):.4f}")
+                    
             # Encontrar termos relevantes para a classificação
             text = self._get_text(data)
             top_terms = self._get_top_terms_for_class(predicted_class_str, text, top_n=5)
@@ -656,20 +688,20 @@ class SentimentAnalyzer(BaseClassifier):
                 "probabilities": class_probs,
                 "confidence": float(max(probabilities)),
                 "inference_time": inference_time,
-                "relevant_terms": top_terms
+                "relevant_terms": top_terms,
+                "class_mapping": self.class_mapping  # Adicionar para referência
             }
             
             return result
             
         except Exception as e:
             logger.error(f"Erro na predição: {str(e)}", exc_info=True)
-            
             return {
                 "error": f"Erro na predição: {str(e)}",
                 "error_code": "PREDICTION_ERROR",
                 "traceback": str(e.__traceback__)
-            }
-            
+            }  
+                   
     def _get_top_terms_for_class(self, class_label: str, text: str, top_n: int = 5) -> List[str]:
         """
         Identifica os termos mais relevantes para a classificação de sentimento.

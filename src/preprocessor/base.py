@@ -540,38 +540,39 @@ class PreprocessorUniversal:
         """
         start_time = time.time() if self.performance_monitoring else None
         
-        # Validar e sanitizar inputs, se disponível
-        if VALIDATORS_AVAILABLE:
-            try:
-                text = sanitize_text(text)
-                metadata = sanitize_metadata(metadata)
-            except Exception as e:
-                logger.warning(f"Erro na validação de inputs: {str(e)}")
-                # Continuar com os valores originais em caso de erro
-        
-        if not text:
-            logger.warning(f"Texto vazio ou inválido para processamento")
-            return {"error": "Texto inválido ou vazio", "original_text": text, "metadata": metadata or {}}
-        
-        result = {
-            "original_text": text,
-            "metadata": metadata or {}
-        }
-        
         try:
+            # Validar e sanitizar inputs
+            if not text:
+                raise ErrorHandler.create_exception(
+                    "Texto vazio ou inválido para processamento",
+                    code=ErrorCode.EMPTY_INPUT,
+                    component="PreprocessorUniversal"
+                )
+            
+            # Inicializar resultado
+            result = {
+                "original_text": text,
+                "metadata": metadata or {}
+            }
+            
             # Normalização
             try:
                 normalized_text = self.normalizer.process(text)
                 result["normalized_text"] = normalized_text
             except Exception as e:
-                logger.error(f"Erro na normalização: {str(e)}")
                 if self.fallback_enabled:
                     # Fallback: usar texto original com normalizações mínimas
                     normalized_text = text.lower() if text else ""
                     result["normalized_text"] = normalized_text
                     result["warnings"] = result.get("warnings", []) + ["Erro na normalização, usando fallback"]
+                    logger.warning(f"Usando fallback para normalização: {str(e)}")
                 else:
-                    raise
+                    raise ErrorHandler.create_exception(
+                        f"Erro na normalização: {str(e)}",
+                        code=ErrorCode.PREPROCESSING_ERROR,
+                        component="Normalizer",
+                        details={"original_exception": str(e)}
+                    )
             
             # Tokenização
             try:
@@ -644,31 +645,23 @@ class PreprocessorUniversal:
             
             return result
             
+        except FinSembleException as e:
+            # Já é uma exceção do nosso sistema, apenas converter para dict
+            error_dict = e.to_dict()
+            # Preservar o texto original e metadados para facilitar depuração
+            error_dict["original_text"] = text
+            error_dict["metadata"] = metadata
+            return error_dict
         except Exception as e:
-            # Registrar erro e atualizar estatísticas
-            logger.error(f"Erro ao processar texto: {str(e)}")
-            self.stats["errors"] += 1
-            
-            # Incluir detalhes do erro no resultado
-            error_result = {
-                "error": str(e), 
-                "original_text": text, 
-                "metadata": metadata or {}
-            }
-            
-            # Adicionar qualquer resultado parcial que tenha sido gerado
-            for key in ["normalized_text", "tokens", "features", "derived_metadata"]:
-                if key in result:
-                    error_result[key] = result[key]
-                    
-            # Adicionar métricas de performance, se ativado
-            if self.performance_monitoring and start_time:
-                error_result["processing_stats"] = {
-                    "processing_time_ms": round((time.time() - start_time) * 1000, 2),
-                    "status": "error"
-                }
-                
-            return error_result
+            # Exceção não esperada, converter para nosso formato padronizado
+            error_dict = ErrorHandler.handle_exception(
+                e, "PreprocessorUniversal", fallback_enabled=self.fallback_enabled
+            )
+            # Preservar o texto original e metadados
+            error_dict["original_text"] = text
+            error_dict["metadata"] = metadata
+            return error_dict
+
     
     def process_batch(self, texts: List[str], metadatas: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
         """

@@ -48,8 +48,7 @@ class Factor:
         var_idx = self.variables.index(variable)
         
         # Criar nova lista de variáveis excluindo a variável marginalizada
-        new_variables = self.variables.copy()
-        new_variables.remove(variable)
+        new_variables = [v for v in self.variables if v != variable]
         
         if not new_variables:
             # Se não sobram variáveis, retornar escalar
@@ -120,44 +119,19 @@ class Factor:
         
     def normalize(self) -> 'Factor':
         """
-        Marginaliza uma variável do fator com verificações aprimoradas.
+        Normaliza o fator para que seus valores somem 1.
         
-        Args:
-            variable: Variável a ser marginalizada
-            
         Returns:
-            Novo fator marginalizado
+            Novo fator normalizado
         """
-        if variable not in self.variables:
-            return self
-            
-        # Encontrar índice da variável
-        var_idx = self.variables.index(variable)
-        
-        # Criar nova lista de variáveis excluindo a variável marginalizada
-        new_variables = [v for v in self.variables if v != variable]
-        
-        if not new_variables:
-            # Se não sobram variáveis, retornar escalar
-            return Factor([], np.sum(self.values), self.variable_domains)
-            
-        # Otimização: usar einsum para marginalização eficiente
-        if var_idx == 0:
-            # Caso especial para eficiência
-            new_values = np.sum(self.values, axis=0)
-        elif var_idx == len(self.variables) - 1:
-            # Outro caso especial para eficiência
-            new_values = np.sum(self.values, axis=-1)
+        total = np.sum(self.values)
+        if total == 0:
+            # Evitar divisão por zero
+            new_values = np.ones_like(self.values) / np.size(self.values)
         else:
-            # Caso geral
-            # Construir string para einsum
-            input_idx = list(range(len(self.variables)))
-            output_idx = [i for i in input_idx if i != var_idx]
+            new_values = self.values / total
             
-            # Usar einsum para marginalização eficiente
-            new_values = np.einsum(self.values, input_idx, output_idx)
-            
-        return Factor(new_variables, new_values, self.variable_domains)
+        return Factor(self.variables.copy(), new_values, self.variable_domains)
 
     @staticmethod
     def from_cpt(node_name: str, states: List[str], parents: List[str], 
@@ -209,8 +183,8 @@ class BeliefPropagator:
         self.damping = config.get("damping", 0.5)
         
     def variable_elimination(self, factors: List[Factor], 
-                           query_variables: List[str], 
-                           elimination_order: Optional[List[str]] = None) -> Dict[str, Dict[str, float]]:
+                       query_variables: List[str], 
+                       elimination_order: Optional[List[str]] = None) -> Dict[str, Dict[str, float]]:
         """
         Implementa o algoritmo de eliminação de variáveis otimizado.
         
@@ -227,22 +201,20 @@ class BeliefPropagator:
             return {var: {} for var in query_variables}
             
         # Evitar modificar a lista original
-        current_factors = factors.copy()
+        current_factors = list(factors)
         
         # Obter todas as variáveis
         all_variables = set()
         for factor in factors:
             all_variables.update(factor.variables)
             
-        # Determinar variáveis a eliminar
+        # Determinar variáveis a eliminar (excluindo variáveis de consulta)
         eliminate_variables = list(all_variables - set(query_variables))
         
         # Determinar a ordem de eliminação
         if elimination_order is None:
-            # Heurística: eliminar variáveis que aparecem em menos fatores primeiro
-            var_count = {var: sum(1 for f in current_factors if var in f.variables) 
-                        for var in eliminate_variables}
-            elimination_order = sorted(eliminate_variables, key=lambda v: var_count[v])
+            # Heurística min-fill: escolhe a variável que adiciona menos arestas ao grafo moral
+            elimination_order = self._min_fill_heuristic(factors, eliminate_variables, query_variables)
         else:
             # Verificar se a ordem inclui todas as variáveis a eliminar
             missing_vars = set(eliminate_variables) - set(elimination_order)
@@ -257,7 +229,7 @@ class BeliefPropagator:
             if var in query_variables:
                 continue
                 
-            # Otimização: encontrar fatores relevantes de forma eficiente
+            # Encontrar fatores relevantes de forma eficiente
             relevant_factors = []
             irrelevant_factors = []
             
@@ -271,7 +243,10 @@ class BeliefPropagator:
                 continue
                 
             # Multiplicar fatores relevantes de forma otimizada
+            # Começar com o menor fator e multiplicar progressivamente
+            relevant_factors.sort(key=lambda f: f.values.size)
             product_factor = relevant_factors[0]
+            
             for i in range(1, len(relevant_factors)):
                 product_factor = product_factor.product(relevant_factors[i])
                 
@@ -280,55 +255,128 @@ class BeliefPropagator:
             
             # Atualizar lista de fatores
             current_factors = irrelevant_factors + [marginal_factor]
-            
-        # Preparar resultados para cada variável de consulta
-        results = {}
-        variable_factors = {var: [] for var in query_variables}
         
-        # Agrupar fatores por variável de consulta
-        for factor in current_factors:
-            for var in factor.variables:
-                if var in query_variables:
-                    variable_factors[var].append(factor)
-                    
-        # Calcular distribuição para cada variável de consulta
+        # Juntar todos os fatores finais
+        if len(current_factors) > 1:
+            # Ordenar por tamanho para eficiência
+            current_factors.sort(key=lambda f: f.values.size)
+            final_factor = current_factors[0]
+            
+            for i in range(1, len(current_factors)):
+                final_factor = final_factor.product(current_factors[i])
+        elif len(current_factors) == 1:
+            final_factor = current_factors[0]
+        else:
+            # Caso sem fatores (não deve ocorrer)
+            return {var: {} for var in query_variables}
+        
+        # Obter distribuições marginais para variáveis de consulta
+        results = {}
+        
         for var in query_variables:
-            if not variable_factors[var]:
-                # Se não há fatores para esta variável, usar distribuição uniforme
+            # Se a variável não estiver no fator final
+            if var not in final_factor.variables:
+                # Distribuição uniforme
                 states = factors[0].variable_domains[var]
                 results[var] = {state: 1.0/len(states) for state in states}
                 continue
                 
-            # Multiplicar todos os fatores relevantes
-            result_factor = variable_factors[var][0]
-            for i in range(1, len(variable_factors[var])):
-                result_factor = result_factor.product(variable_factors[var][i])
-                
-            # Marginalizar todas as variáveis exceto a de consulta
-            for other_var in result_factor.variables:
+            # Se houver outras variáveis, marginalizar todas exceto a atual
+            temp_factor = final_factor
+            for other_var in final_factor.variables:
                 if other_var != var:
-                    result_factor = result_factor.marginalize(other_var)
+                    temp_factor = temp_factor.marginalize(other_var)
                     
             # Normalizar
-            total = np.sum(result_factor.values)
-            if total > 0:
-                normalized_values = result_factor.values / total
-            else:
-                # Distribuição uniforme se soma for zero
-                normalized_values = np.ones_like(result_factor.values) / len(result_factor.values)
-                
+            temp_factor = temp_factor.normalize()
+            
             # Converter para dicionário
             states = factors[0].variable_domains[var]
-            results[var] = {state: float(prob) for state, prob in zip(states, normalized_values)}
-            
+            results[var] = {state: float(prob) for state, prob in zip(states, temp_factor.values)}
+        
         return results
-            
-    def loopy_belief_propagation(self, bayesian_network: 'BayesianNetwork',
-                               evidence: Dict[str, str],
-                               query_nodes: List[str] = None,
-                               max_iterations: int = None) -> Dict[str, Dict[str, float]]:
+    
+    def _min_fill_heuristic(self, factors: List[Factor], 
+                       eliminate_variables: List[str],
+                       query_variables: List[str]) -> List[str]:
         """
-        Implementa o algoritmo de propagação de crenças com loops melhorado.
+        Implementa a heurística min-fill para escolher a ordem de eliminação de variáveis.
+        
+        Esta heurística escolhe a variável que adiciona o menor número de arestas ao grafo.
+        
+        Args:
+            factors: Lista de fatores
+            eliminate_variables: Variáveis a eliminar
+            query_variables: Variáveis de consulta
+            
+        Returns:
+            Ordem otimizada de eliminação
+        """
+        # Construir grafo não direcionado representando dependências entre variáveis
+        graph = {}
+        
+        # Adicionar nós
+        all_vars = set(eliminate_variables) | set(query_variables)
+        for var in all_vars:
+            graph[var] = set()
+        
+        # Adicionar arestas
+        for factor in factors:
+            vars_in_factor = factor.variables
+            for i in range(len(vars_in_factor)):
+                for j in range(i+1, len(vars_in_factor)):
+                    graph[vars_in_factor[i]].add(vars_in_factor[j])
+                    graph[vars_in_factor[j]].add(vars_in_factor[i])
+        
+        # Calcular ordem de eliminação usando min-fill
+        ordering = []
+        remaining_vars = set(eliminate_variables)
+        
+        while remaining_vars:
+            # Encontrar variável que adiciona menos arestas quando eliminada
+            min_fill_var = None
+            min_fill_count = float('inf')
+            
+            for var in remaining_vars:
+                # Vizinhos não conectados
+                neighbors = graph[var]
+                fill_edges = 0
+                
+                # Contar quantas arestas seriam adicionadas
+                for i, neigh1 in enumerate(neighbors):
+                    for neigh2 in list(neighbors)[i+1:]:
+                        if neigh2 not in graph[neigh1]:
+                            fill_edges += 1
+                
+                if fill_edges < min_fill_count:
+                    min_fill_count = fill_edges
+                    min_fill_var = var
+            
+            # Adicionar à ordenação
+            ordering.append(min_fill_var)
+            remaining_vars.remove(min_fill_var)
+            
+            # Atualizar o grafo (adicionar arestas entre vizinhos)
+            neighbors = list(graph[min_fill_var])
+            for i in range(len(neighbors)):
+                for j in range(i+1, len(neighbors)):
+                    graph[neighbors[i]].add(neighbors[j])
+                    graph[neighbors[j]].add(neighbors[i])
+                    
+            # Remover o nó do grafo
+            for neigh in neighbors:
+                if min_fill_var in graph[neigh]:
+                    graph[neigh].remove(min_fill_var)
+            del graph[min_fill_var]
+        
+        return ordering        
+    
+    def loopy_belief_propagation(self, bayesian_network: 'BayesianNetwork',
+                           evidence: Dict[str, str],
+                           query_nodes: List[str] = None,
+                           max_iterations: int = None) -> Dict[str, Dict[str, float]]:
+        """
+        Implementa o algoritmo de propagação de crenças com loops (Loopy Belief Propagation).
         
         Args:
             bayesian_network: Rede bayesiana
@@ -346,18 +394,29 @@ class BeliefPropagator:
         if query_nodes is None:
             query_nodes = [n for n in bayesian_network.nodes if n not in evidence]
             
-        # Construir grafo de fatores
+        # Criar fatores a partir da rede bayesiana
         factors = []
         variable_domains = {}
-        factor_to_vars = {}
-        var_to_factors = defaultdict(list)
         
-        # Converter a rede bayesiana para fatores
-        for i, (node_name, node) in enumerate(bayesian_network.nodes.items()):
-            # Registrar domínios
+        # Mapear variáveis para fatores e vice-versa
+        var_to_factors = defaultdict(list)
+        factor_to_vars = {}
+        
+        # Converter a rede para fatores
+        for node_name, node in bayesian_network.nodes.items():
+            # Registrar domínios das variáveis
             variable_domains[node_name] = node.states
             
             # Criar fator a partir da CPT
+            factor_vars = [node_name] + node.parents
+            factor_name = f"f_{node_name}"
+            
+            # Registrar mapeamentos
+            factor_to_vars[factor_name] = factor_vars
+            for var in factor_vars:
+                var_to_factors[var].append(factor_name)
+                
+            # Criar e adicionar o fator
             factor = Factor.from_cpt(
                 node_name, 
                 node.states, 
@@ -365,106 +424,192 @@ class BeliefPropagator:
                 node.cpt, 
                 variable_domains
             )
-            
-            # Registrar mapeamentos de fator para variáveis e vice-versa
-            factor_name = f"f{i}"
-            factor_to_vars[factor_name] = factor.variables
-            
-            for var in factor.variables:
-                var_to_factors[var].append(factor_name)
-                
-            factors.append(factor)
-            
-        # Incorporar evidências
+            factors.append((factor_name, factor))
+        
+        # Incorporar evidências como fatores adicionais
         for var, val in evidence.items():
-            # Criar fator de evidência
-            var_idx = bayesian_network.nodes[var].states.index(val)
-            evidence_values = np.zeros(len(bayesian_network.nodes[var].states))
+            if var not in variable_domains:
+                continue
+                
+            # Criar um fator unitário para a evidência
+            var_idx = variable_domains[var].index(val)
+            evidence_values = np.zeros(len(variable_domains[var]))
             evidence_values[var_idx] = 1.0
             
             evidence_factor = Factor([var], evidence_values, variable_domains)
-            factors.append(evidence_factor)
             
-            # Atualizar mapeamentos
-            factor_name = f"f{len(factors)-1}"
-            factor_to_vars[factor_name] = [var]
-            var_to_factors[var].append(factor_name)
+            # Registrar fator de evidência
+            evidence_factor_name = f"f_ev_{var}"
+            factors.append((evidence_factor_name, evidence_factor))
+            factor_to_vars[evidence_factor_name] = [var]
+            var_to_factors[var].append(evidence_factor_name)
         
-        # Inicializar mensagens
+        # Inicializar mensagens (var->factor e factor->var)
         messages = {}
+        factor_dict = dict(factors)
+        
+        # Para cada variável e cada fator conectado
         for var in var_to_factors:
             for factor_name in var_to_factors[var]:
-                # Mensagem variável -> fator
-                messages[(var, factor_name)] = np.ones(len(variable_domains[var]))
+                # Mensagem variável -> fator (inicialmente uniforme)
+                domain_size = len(variable_domains[var])
+                messages[(var, factor_name)] = np.ones(domain_size) / domain_size
                 
-                # Mensagem fator -> variável
-                messages[(factor_name, var)] = np.ones(len(variable_domains[var]))
-                
-        # Algoritmo de passagem de mensagens (Sum-Product)
+                # Mensagem fator -> variável (inicialmente uniforme)
+                messages[(factor_name, var)] = np.ones(domain_size) / domain_size
+        
+        # Algoritmo de passagem de mensagens
+        converged = False
+        
         for iteration in range(max_iterations):
-            old_messages = messages.copy()
+            old_messages = {k: v.copy() for k, v in messages.items()}
+            max_diff = 0.0
             
-            # Atualizar mensagens variável -> fator
+            # 1. Atualizar mensagens: variável -> fator
             for var in var_to_factors:
+                domain_size = len(variable_domains[var])
+                
                 for factor_name in var_to_factors[var]:
-                    # Produto das mensagens de outros fatores para esta variável
-                    msg = np.ones(len(variable_domains[var]))
+                    # Iniciar com mensagem uniforme
+                    msg = np.ones(domain_size)
+                    
+                    # Multiplicar por todas as mensagens de outros fatores para esta variável
                     for other_factor in var_to_factors[var]:
                         if other_factor != factor_name:
                             msg *= messages[(other_factor, var)]
-                            
+                    
+                    # Normalizar a mensagem
+                    msg_sum = np.sum(msg)
+                    if msg_sum > 0:
+                        msg = msg / msg_sum
+                    else:
+                        msg = np.ones(domain_size) / domain_size
+                    
+                    # Atualizar a mensagem no dicionário
                     messages[(var, factor_name)] = msg
-                    
-            # Atualizar mensagens fator -> variável
-            for factor_idx, factor in enumerate(factors):
-                factor_name = f"f{factor_idx}"
-                vars_in_factor = factor_to_vars[factor_name]
+            
+            # 2. Atualizar mensagens: fator -> variável
+            for factor_name, factor in factors:
+                factor_vars = factor_to_vars[factor_name]
                 
-                for var in vars_in_factor:
-                    # Marginalização do produto do fator com mensagens de outras variáveis
-                    # Cálculo completo seria mais complexo, mas simplificamos para ilustração
+                for var_idx, var in enumerate(factor_vars):
+                    # Domínio da variável
+                    domain_size = len(variable_domains[var])
                     
-                    # Na prática, calcularíamos:
-                    # 1. Produto do fator com mensagens de outras variáveis
-                    # 2. Marginalização para obter mensagem para a variável atual
+                    # Inicializar mensagem
+                    msg = np.zeros(domain_size)
                     
-                    # Implementação simplificada
-                    msg = np.ones(len(variable_domains[var]))
-                    var_idx = factor.variables.index(var) if var in factor.variables else -1
-                    
-                    if var_idx >= 0 and var_idx < factor.values.ndim:
-                        # Marginalizar ao longo do eixo da variável
-                        msg = np.sum(factor.values, axis=var_idx)
+                    # Para cada possível valor da variável atual
+                    for val_idx in range(domain_size):
+                        # Criar um dicionário para armazenar a atribuição atual
+                        var_assignment = {var: val_idx}
                         
+                        # Calcular a soma sobre todas as outras variáveis
+                        self._sum_product_message(
+                            factor_name, factor, factor_vars, var_idx, 
+                            var_assignment, messages, variable_domains, 0, 1.0, msg
+                        )
+                    
+                    # Normalizar a mensagem
+                    msg_sum = np.sum(msg)
+                    if msg_sum > 0:
+                        msg = msg / msg_sum
+                    else:
+                        msg = np.ones(domain_size) / domain_size
+                    
+                    # Atualizar a mensagem e calcular a diferença
+                    old_msg = old_messages.get((factor_name, var), np.zeros(domain_size))
+                    diff = np.max(np.abs(msg - old_msg))
+                    max_diff = max(max_diff, diff)
+                    
+                    # Aplicar damping para ajudar na convergência
+                    if self.damping > 0:
+                        msg = self.damping * old_msg + (1 - self.damping) * msg
+                    
                     messages[(factor_name, var)] = msg
-                    
+            
             # Verificar convergência
-            max_diff = 0.0
-            for key in messages:
-                diff = np.max(np.abs(messages[key] - old_messages.get(key, np.zeros_like(messages[key]))))
-                max_diff = max(max_diff, diff)
-                
             if max_diff < self.convergence_threshold:
-                logger.info(f"Convergência alcançada na iteração {iteration+1}")
+                converged = True
+                logger.info(f"LBP convergiu após {iteration+1} iterações")
                 break
-                
-        # Calcular crenças marginais
+        
+        if not converged:
+            logger.warning(f"LBP não convergiu após {max_iterations} iterações")
+        
+        # Calcular crenças marginais para os nós de consulta
         beliefs = {}
+        
         for var in query_nodes:
-            if var in var_to_factors:
-                # Produto de todas as mensagens para esta variável
-                belief = np.ones(len(variable_domains[var]))
-                for factor_name in var_to_factors[var]:
-                    belief *= messages[(factor_name, var)]
-                    
-                # Normalizar
-                belief = belief / np.sum(belief)
+            if var not in var_to_factors:
+                continue
                 
-                # Converter para dicionário
-                beliefs[var] = {state: float(prob) 
-                              for state, prob in zip(variable_domains[var], belief)}
-                              
+            # Inicializar com vetor uniforme
+            domain_size = len(variable_domains[var])
+            belief = np.ones(domain_size)
+            
+            # Multiplicar por todas as mensagens para esta variável
+            for factor_name in var_to_factors[var]:
+                belief *= messages[(factor_name, var)]
+            
+            # Normalizar
+            belief_sum = np.sum(belief)
+            if belief_sum > 0:
+                belief = belief / belief_sum
+            else:
+                belief = np.ones(domain_size) / domain_size
+            
+            # Converter para dicionário
+            beliefs[var] = {
+                state: float(prob) for state, prob in zip(variable_domains[var], belief)
+            }
+        
         return beliefs
+
+    def _sum_product_message(self, factor_name, factor, factor_vars, target_var_idx, 
+                        var_assignment, messages, variable_domains, 
+                        current_var_idx, factor_value, result_msg):
+        """
+        Função auxiliar recursiva para cálculo de mensagens no algoritmo sum-product.
+        
+        Calcula a mensagem de um fator para uma variável percorrendo todas as 
+        possíveis atribuições de valores para as outras variáveis.
+        """
+        if current_var_idx == len(factor_vars):
+            # Extrair o índice da variável alvo na atribuição atual
+            target_var = factor_vars[target_var_idx]
+            target_val_idx = var_assignment[target_var]
+            
+            # Multiplicar pelo valor do fator para esta atribuição e acumular no resultado
+            result_msg[target_val_idx] += factor_value
+            return
+        
+        # Pular a variável alvo na recursão
+        if current_var_idx == target_var_idx:
+            self._sum_product_message(
+                factor_name, factor, factor_vars, target_var_idx,
+                var_assignment, messages, variable_domains,
+                current_var_idx + 1, factor_value, result_msg
+            )
+            return
+        
+        # Para cada valor possível da variável atual
+        var = factor_vars[current_var_idx]
+        domain_size = len(variable_domains[var])
+        
+        for val_idx in range(domain_size):
+            # Atualizar a atribuição para esta variável
+            var_assignment[var] = val_idx
+            
+            # Obter a mensagem da variável para este fator
+            msg_value = messages.get((var, factor_name), np.ones(domain_size))[val_idx]
+            
+            # Continuar a recursão
+            self._sum_product_message(
+                factor_name, factor, factor_vars, target_var_idx,
+                var_assignment, messages, variable_domains,
+                current_var_idx + 1, factor_value * msg_value, result_msg
+            )
     
     def junction_tree_inference(self, bayesian_network: 'BayesianNetwork', 
                              evidence: Dict[str, str],
