@@ -22,6 +22,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.utils.validation import check_X_y, check_array
 from sklearn.model_selection import GridSearchCV
 
+from src.utils.feature_manager import FeatureManager
 from src.classifiers.base import BaseClassifier
 from src.utils.feature_extractors import (
     LexiconFeatureExtractor, 
@@ -190,6 +191,17 @@ class SentimentAnalyzer(BaseClassifier):
         
         logger.info(f"Analisador de Sentimento v{self.version} inicializado com parâmetros: alpha={self.alpha}, "
                     f"fit_prior={self.fit_prior}, norm={self.norm}, max_features={self.max_features}")
+        
+        # Inicializar o gerenciador de características
+        feature_manager_config = config.get("feature_manager", {})
+        self.feature_manager = FeatureManager(feature_manager_config)
+        
+        # Após inicializar o vectorizer, registrá-lo no gerenciador
+        if self.vectorizer:
+            self.feature_manager.register_vectorizer("sentiment", self.vectorizer)
+        
+        # Registrar extratores personalizados
+        self.feature_manager.register_extractor("sentiment_custom", self._extract_custom_features)
                     
     def _init_feature_extractors(self):
         """Inicializa os extratores de características."""
@@ -412,49 +424,40 @@ class SentimentAnalyzer(BaseClassifier):
         is_valid, error = self._validate_input(preprocessed_data)
         if not is_valid:
             logger.error(f"Validação de entrada falhou: {error['error']}")
-            
-            if self.vectorizer and hasattr(self.vectorizer, 'vocabulary_'):
-                # Retornar vetor de zeros como fallback
-                return np.zeros((len(self.vectorizer.get_feature_names_out())))
-                
             return np.array([])
             
         # Obter texto para processamento
-        text = self._get_text(preprocessed_data)
-        
-        # Verificar se o modelo está em modo de predição (com vectorizer treinado)
-        if not self.vectorizer or not hasattr(self.vectorizer, 'vocabulary_'):
-            # Em modo de extração para treinamento, retornamos o texto normalizado
-            logger.debug("Modo de treinamento: retornando texto para vetorização posterior")
-            return text
+        if "normalized_text" in preprocessed_data:
+            text = preprocessed_data["normalized_text"]
+        else:
+            text = preprocessed_data["original_text"]
             
-        # Em modo de predição, extrair características de texto e customizadas
         try:
-            # Extrair características de texto
-            text_features = self._extract_text_features(text)
+            # Usar o gerenciador para extração eficiente
+            text_features = self.feature_manager.extract_text_features(
+                text, "sentiment", as_sparse=False
+            )
             
-            # Extrair características customizadas
-            custom_features = self._extract_custom_features(preprocessed_data)
+            # Extrair características customizadas através do gerenciador
+            custom_features = self.feature_manager.extract_custom_features(
+                preprocessed_data, "sentiment_custom"
+            )
             
             # Combinar características
-            combined_features = self._combine_features(text_features, custom_features)
+            combined_features = self.feature_manager.combine_features(
+                text_features, custom_features, force_dense=True
+            )
             
             return combined_features
             
         except Exception as e:
-            logger.error(f"Erro na extração de características: {str(e)}")
-            
-            # Retornar vetor de zeros como fallback
-            if self.vectorizer and hasattr(self.vectorizer, 'vocabulary_'):
-                return np.zeros((len(self.vectorizer.get_feature_names_out())))
-                
+            logger.error(f"Erro na extração de características: {str(e)}", exc_info=True)
             return np.array([])
             
     @timed
     def _prepare_training_features(self, training_data: List[Dict[str, Any]]) -> np.ndarray:
         """
-        Sobrescreve o método da classe base para incluir vetorização de texto
-        e extração de características personalizadas.
+        Sobrescreve o método da classe base para incluir extração paralela eficiente.
         
         Args:
             training_data: Lista de dados preprocessados
@@ -465,19 +468,9 @@ class SentimentAnalyzer(BaseClassifier):
         start_time = time.time()
         logger.info(f"Preparando características para treinamento com {len(training_data)} amostras")
         
-        # Extrair textos normalizados e características customizadas
+        # Extrair textos normalizados
         texts = []
-        custom_features_list = []
-        
-        # Usar processamento em lotes para melhor eficiência
-        def process_training_sample(data):
-            # Validar entrada
-            is_valid, error = self._validate_input(data)
-            if not is_valid:
-                logger.warning(f"Amostra inválida: {error['error']}")
-                return ("", {})
-                
-            # Obter texto
+        for data in training_data:
             if "normalized_text" in data:
                 text = data["normalized_text"]
             elif "original_text" in data:
@@ -485,110 +478,88 @@ class SentimentAnalyzer(BaseClassifier):
             else:
                 logger.warning("Amostra sem texto, usando string vazia")
                 text = ""
-                
-            # Extrair características customizadas
-            custom_features = self._extract_custom_features(data)
-            
-            return (text, custom_features)
-            
-        # Processar amostras em lotes
-        try:
-            # Tentar processar em paralelo para melhor performance
-            results = batch_process(
-                training_data, 
-                process_training_sample, 
-                batch_size=100,
-                parallel=True
-            )
-            
-            # Desempacotar resultados
-            texts, custom_features_list = zip(*results) if results else ([], [])
-            
-        except Exception as e:
-            logger.warning(f"Erro no processamento em lotes: {str(e)}. Processando sequencialmente.")
-            
-            # Fallback para processamento sequencial
-            for data in training_data:
-                text, custom_features = process_training_sample(data)
-                texts.append(text)
-                custom_features_list.append(custom_features)
-                
-        # Log da configuração do vetorizador
-        logger.info(f"Inicializando vetorizador com: max_features={self.max_features}, "
-                  f"min_df={self.min_df}, ngram_range={self.ngram_range}")
-                  
-        # Inicializar e treinar o vetorizador
+            texts.append(text)
+        
+        # Inicializar e treinar o vetorizador com todos os textos
         self.vectorizer = CountVectorizer(
             max_features=self.max_features,
             min_df=self.min_df,
             ngram_range=self.ngram_range
         )
         
-        # Vetorizar textos
+        # Vetorizar textos mantendo representação esparsa
         logger.info("Vetorizando textos...")
-        X_text = self.vectorizer.fit_transform(texts).toarray()
+        X_text = self.vectorizer.fit_transform(texts)
         
-        # Criar e aplicar transformação TF-IDF se configurada
+        # Registrar vetorizador no gerenciador de características
+        self.feature_manager.register_vectorizer("sentiment", self.vectorizer)
+        
+        # Aplicar transformação TF-IDF se configurada, mantendo representação esparsa
         if self.use_idf:
             logger.info("Aplicando transformação TF-IDF...")
             self.tfidf_transformer = TfidfTransformer()
-            X_text = self.tfidf_transformer.fit_transform(X_text).toarray()
-            
+            X_text = self.tfidf_transformer.fit_transform(X_text)
+        
         # Armazenar nomes das características
         self.feature_names = self.vectorizer.get_feature_names_out()
         
-        # Log das características extraídas
+        # Log de informações
         vocab_size = len(self.vectorizer.vocabulary_)
         logger.info(f"Vetorização concluída: {vocab_size} termos extraídos do vocabulário")
         
-        if logger.isEnabledFor(logging.DEBUG):
-            # Log dos top N termos mais frequentes
-            top_n = min(20, vocab_size)
-            word_counts = X_text.sum(axis=0)
-            top_indices = word_counts.argsort()[-top_n:][::-1]
-            top_terms = [(self.feature_names[i], int(word_counts[i])) for i in top_indices]
-            logger.debug(f"Top {top_n} termos mais frequentes: {top_terms}")
-            
-        # Verificar se temos características customizadas para incorporar
+        # Extração de características customizadas em paralelo
+        custom_features_list = []
+        
+        # Função para extrair características customizadas de uma amostra
+        def extract_custom(data):
+            return self.feature_manager.extract_custom_features(data, "sentiment_custom")
+        
+        # Processar em paralelo com ThreadPoolExecutor (mais eficiente para esta tarefa I/O bound)
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            custom_features_list = list(executor.map(extract_custom, training_data))
+        
+        # Combinar todas as características
+        # Primeiro, converter características customizadas para formato compatível
         if custom_features_list and any(custom_features_list):
-            logger.info("Processando características customizadas...")
-            
-            # Converter para DataFrame para manipulação mais fácil
             custom_df = pd.DataFrame(custom_features_list)
-            
-            # Selecionar apenas colunas numéricas e booleanas
             numeric_cols = custom_df.select_dtypes(include=['number', 'bool']).columns
             
             if not numeric_cols.empty:
                 X_custom = custom_df[numeric_cols].values
                 
-                # Combinar características de texto e customizadas
-                X_combined = np.hstack((X_text, X_custom))
+                # Combinar características mantendo formato esparso até o final
+                if sp.issparse(X_text):
+                    X_custom_sparse = sp.csr_matrix(X_custom)
+                    X_combined = sp.hstack([X_text, X_custom_sparse])
+                else:
+                    X_combined = np.hstack((X_text, X_custom))
                 
                 # Atualizar nomes das características
                 self.feature_names = np.concatenate([self.feature_names, np.array(numeric_cols)])
                 
                 logger.info(f"Adicionadas {len(numeric_cols)} características customizadas")
-                
-                # Log do tempo de processamento
-                processing_time = time.time() - start_time
-                logger.info(f"Preparação de características concluída em {processing_time:.2f} segundos")
-                
-                # Dimensões do conjunto de treinamento
                 logger.info(f"Dimensões finais do conjunto de características: {X_combined.shape}")
                 
-                return X_combined
-            else:
-                logger.warning("Nenhuma característica customizada numérica ou booleana encontrada")
-                
-        # Log do tempo de processamento
-        processing_time = time.time() - start_time
-        logger.info(f"Preparação de características concluída em {processing_time:.2f} segundos")
+                # Converter para array denso apenas no final, se necessário
+                # Importante: alguns algoritmos trabalham diretamente com matrizes esparsas
+                # Verificar se o algoritmo suporta entrada esparsa antes de converter
+                if hasattr(self.model, "_validate_data") and not sp.issparse(X_combined):
+                    try:
+                        # Tentar manter esparso, conversão apenas se necessário
+                        return X_combined
+                    except:
+                        # Se o modelo exigir formato denso, converter
+                        return X_combined.toarray() if sp.issparse(X_combined) else X_combined
+                else:
+                    # Converter para formato denso para compatibilidade geral
+                    return X_combined.toarray() if sp.issparse(X_combined) else X_combined
         
-        # Se não há características customizadas utilizáveis, retornar apenas texto
-        logger.info(f"Dimensões finais do conjunto de características: {X_text.shape}")
-        
-        return X_text
+        # Se não há características customizadas, apenas retornar X_text
+        # Converter para formato denso apenas se necessário
+        if hasattr(self.model, "_validate_data") and not sp.issparse(X_text):
+            return X_text
+        else:
+            return X_text.toarray() if sp.issparse(X_text) else X_text
         
     @timed
     def predict(self, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -620,6 +591,32 @@ class SentimentAnalyzer(BaseClassifier):
         logger.debug(f"Iniciando predição para amostra")
         
         try:
+                # Verificar se precisamos fazer preprocessamento adicional
+            if "normalized_text" not in data or "tokens" not in data or "features" not in data:
+                # Precisamos garantir que tenhamos o preprocessamento necessário
+                if "original_text" in data:
+                    # Obter preprocessador universal
+                    from src.preprocessor.base import preprocessor_instance
+                    
+                    # Criar requisitos específicos para análise de sentimento
+                    requirements = {
+                        "normalize": True,
+                        "tokenize": True,
+                        "extract_features": True,
+                        "extract_type_features": False,  # Não precisamos para sentimento
+                        "extract_sentiment_features": True,
+                        "extract_impact_features": False  # Não precisamos para sentimento
+                    }
+                    
+                    # Fazer preprocessamento seletivo
+                    preprocessed = preprocessor_instance.process(
+                        data["original_text"],
+                        data.get("metadata"),
+                        requirements
+                    )
+                    
+                    # Atualizar dados com resultados do preprocessamento
+                    data.update(preprocessed)
             # Extrair características
             features = self._extract_features(data)
             
